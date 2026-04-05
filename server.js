@@ -8,160 +8,103 @@ require('dotenv').config()
 
 const app = express()
 const PORT = process.env.PORT || 3000
+const KEY = Buffer.from(process.env.SECRET_KEY || crypto.randomBytes(32).toString('hex'), 'hex')
 
-if(!process.env.SECRET_KEY){
-  console.log("❌ missing SECRET_KEY in env")
-  process.exit(1)
-}
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 
-const KEY = Buffer.from(process.env.SECRET_KEY,'hex')
-
-app.use(express.json({limit:"2mb"}))
-app.use(express.urlencoded({extended:true}))
-
-// ====== STORAGE ======
-const DIR = path.join(__dirname,'scripts')
+const DIR = path.join(__dirname, 'scripts')
 fs.ensureDirSync(DIR)
+
 const TOKENS = new Map()
-const IV_LEN = 16
+const IV = 16
 
-// ====== ENCRYPT / DECRYPT ======
-function encrypt(text){
-  const iv = crypto.randomBytes(IV_LEN)
-  const cipher = crypto.createCipheriv('aes-256-cbc',KEY,iv)
-  let enc = cipher.update(text,'utf8','hex')
-  enc += cipher.final('hex')
-  return iv.toString('hex')+':'+enc
+const enc = t => {
+  const iv = crypto.randomBytes(IV)
+  const c = crypto.createCipheriv('aes-256-cbc', KEY, iv)
+  let e = c.update(t, 'utf8', 'hex')
+  e += c.final('hex')
+  return iv.toString('hex') + ':' + e
 }
 
-function decrypt(data){
-  const [ivHex,enc] = data.split(':')
-  const iv = Buffer.from(ivHex,'hex')
-  const decipher = crypto.createDecipheriv('aes-256-cbc',KEY,iv)
-  let str = decipher.update(enc,'hex','utf8')
-  str += decipher.final('utf8')
-  return str
+const dec = d => {
+  const [ivh, data] = d.split(':')
+  const iv = Buffer.from(ivh, 'hex')
+  const dc = crypto.createDecipheriv('aes-256-cbc', KEY, iv)
+  let r = dc.update(data, 'hex', 'utf8')
+  r += dc.final('utf8')
+  return r
 }
 
-// ====== PACK / UNPACK ======
-function packScript(src){
-  const def = pako.deflate(src)
-  const b64 = Buffer.from(def).toString('base64')
-  return encrypt(b64)
+const pack = s => enc(Buffer.from(pako.deflate(s)).toString('base64'))
+const unpack = e => pako.inflate(Buffer.from(dec(e), 'base64'), { to: 'string' })
+
+const hash = t => crypto.createHmac('sha256', KEY).update(t).digest('hex')
+
+const badUA = ua => {
+  ua = (ua||'').toLowerCase()
+  return ['curl','wget','python','postman','insomnia','httpclient'].some(x=>ua.includes(x))
 }
 
-function unpackScript(packed){
-  const b64 = decrypt(packed)
-  const buf = Buffer.from(b64,'base64')
-  return pako.inflate(buf,{to:'string'})
-}
+const limiter = rateLimit({ windowMs: 10000, max: 20 })
 
-// ====== SIGN ======
-function sign(x){
-  return crypto.createHmac('sha256',KEY).update(x).digest('hex')
-}
-
-// ====== FILTER UA ======
-function isBadUA(ua){
-  ua=(ua||'').toLowerCase()
-  return ['curl','wget','python','postman','insomnia','httpclient','axios'].some(v=>ua.includes(v))
-}
-
-// ====== RATE LIMIT ======
-const limiter = rateLimit({windowMs:10000,max:25})
-
-// ====== UPLOAD ======
-app.post('/upload',limiter,(req,res)=>{
-  try{
-    const content = req.body.content
-    if(!content) return res.status(400).json({error:"no content"})
-
-    const id = crypto.randomBytes(8).toString('hex')
-    const packed = packScript(content)
-    fs.writeFileSync(path.join(DIR,id+'.enc'),packed)
-
-    const base = `${req.protocol}://${req.get('host')}`
-
-    res.json({
-      id,
-      loader:`loadstring(game:HttpGet("${base}/token/${id}"))()`
-    })
-  }catch(e){
-    res.status(500).json({error:"server"})
-  }
+// Upload script
+app.post('/upload', limiter, (req,res)=>{
+  let c = req.body.content
+  if(!c) return res.status(400).json({error:'no content'})
+  const id = crypto.randomBytes(8).toString('hex')
+  fs.writeFileSync(path.join(DIR,id+'.enc'), pack(c))
+  res.json({
+    id,
+    loader:`loadstring(game:HttpGet("${req.protocol}://${req.get('host')}/token/${id}"))()`
+  })
 })
 
-// ====== TOKEN ======
-app.get('/token/:id',(req,res)=>{
-  if(isBadUA(req.headers['user-agent'])) return res.status(403).send('blocked')
-
+// Token endpoint
+app.get('/token/:id', (req,res)=>{
+  if(badUA(req.headers['user-agent'])) return res.status(403).send('denied')
   const id = req.params.id
-  const t = crypto.randomBytes(12).toString('hex')
-  const ts = Date.now()
-
-  TOKENS.set(t,{id,time:ts,ip:req.ip,ua:req.headers['user-agent']})
-  const sig = sign(t+ts)
-
+  const token = crypto.randomBytes(12).toString('hex')
+  const time = Date.now()
+  TOKENS.set(token,{id,time})
+  const sig = hash(token + time)
   res.send(`
 return (function()
-  local t="${t}"
-  local ts="${ts}"
+  local t="${token}"
+  local ts="${time}"
   local sig="${sig}"
-  local u="${req.protocol}://${req.get('host')}/load/${id}?t="..t.."&ts="..ts.."&sig="..sig
-  return game:HttpGet(u)
+  local url="${req.protocol}://${req.get('host')}/load/${id}?t="..t.."&ts="..ts.."&sig="..sig
+  return game:HttpGet(url)
 end)()
 `)
 })
 
-// ====== LOAD ======
-app.get('/load/:id',limiter,(req,res)=>{
-  try{
-    const {t,ts,sig} = req.query
-    const data = TOKENS.get(t)
-
-    if(!data) return res.status(403).send('bad token')
-    if(req.ip!==data.ip) return res.status(403).send('ip mismatch')
-    if(Date.now()-data.time>10000){TOKENS.delete(t);return res.status(403).send('expired')}
-    if(sig!==sign(t+ts)) return res.status(403).send('invalid sig')
-
-    TOKENS.delete(t)
-
-    const file = path.join(DIR,req.params.id+'.enc')
-    if(!fs.existsSync(file)) return res.status(404).send('not found')
-
-    const payload = fs.readFileSync(file,'utf8')
-    res.setHeader('Content-Type','text/plain')
-
-    res.send(`
--- protected loader (multi-layer)
+// Load endpoint (executor only)
+app.get('/load/:id', limiter, (req,res)=>{
+  const {t,ts,sig} = req.query
+  const data = TOKENS.get(t)
+  if(!data) return res.status(403).send('bad token')
+  if(Date.now() - data.time > 10000){ TOKENS.delete(t); return res.status(403).send('expired') }
+  if(sig !== hash(t + ts)) return res.status(403).send('invalid sig')
+  TOKENS.delete(t)
+  const file = path.join(DIR, req.params.id+'.enc')
+  if(!fs.existsSync(file)) return res.status(404).send('not found')
+  const payload = fs.readFileSync(file,'utf8')
+  res.setHeader('Content-Type','text/plain')
+  res.send(`
+-- protected emoji loader
 local d="${payload}"
-local Http=game:GetService("HttpService")
-
-local function _b(x)return Http:Base64Decode(x)end
-local function _d(e)local _,dat=e:match("([^:]+):(.+)") return dat end
-
--- anti fake executor
-if not identifyexecutor then return end
-
--- anti hook
-if rawget(game,'HttpGet')==nil then return end
-
--- decode
-local ok,src=pcall(function() return _b(_d(d)) end)
-if not ok then return end
-
--- junk
-local _=0 for i=1,50 do _=_+i end
-
-return loadstring(src)()
+local function b64(x) return game:GetService("HttpService"):Base64Decode(x) end
+local function dec(e)
+  local iv,dat=e:match("([^:]+):(.+)")
+  local s=""
+  for c in dat:gmatch(".") do s=s.."🤢" end
+  return s
+end
+return loadstring(b64(dec(d)))()
 `)
-  }catch(e){
-    res.status(500).send('err')
-  }
 })
 
-// ====== STATIC / HEALTH CHECK ======
-app.get('/',(req,res)=>res.send('🚀 Protect Lua Server Running'))
 app.use(express.static('public'))
 
-app.listen(PORT,()=>console.log("✅ Server running on port "+PORT))
+app.listen(PORT,()=>console.log("🚀 Protect Lua Server running on port "+PORT))
