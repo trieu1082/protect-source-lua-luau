@@ -2,7 +2,7 @@ const express = require('express');
 const fileUpload = require('express-fileupload');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
@@ -18,26 +18,48 @@ if (!fs.existsSync(OBF_DIR)) {
   fs.mkdirSync(OBF_DIR, { recursive: true });
 }
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    role TEXT DEFAULT 'user'
-  );
-  CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    file_id TEXT UNIQUE NOT NULL,
-    original_name TEXT,
-    obfuscated_name TEXT,
-    source_content TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-`);
+let db;
+async function initDb() {
+  const SQL = await initSqlJs();
+  if (fs.existsSync(DB_PATH)) {
+    const buffer = fs.readFileSync(DB_PATH);
+    db = new SQL.Database(buffer);
+  } else {
+    db = new SQL.Database();
+  }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT DEFAULT 'user'
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS files (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      file_id TEXT UNIQUE NOT NULL,
+      original_name TEXT,
+      obfuscated_name TEXT,
+      source_content TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+  `);
+  saveDb();
+}
+
+function saveDb() {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(DB_PATH, buffer);
+}
+
+initDb().catch(err => {
+  console.error('Không thể khởi tạo database:', err);
+  process.exit(1);
+});
 
 app.use(express.json());
 app.use(fileUpload({ limits: { fileSize: 5 * 1024 * 1024 } }));
@@ -129,10 +151,12 @@ app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Thiếu username/password' });
     if (username.length < 3 || password.length < 4) return res.status(400).json({ error: 'Username >=3, password >=4' });
-    const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    const stmt = db.prepare('SELECT id FROM users WHERE username = ?');
+    const existing = stmt.get([username]);
     if (existing) return res.status(409).json({ error: 'Username đã tồn tại' });
     const hash = await bcrypt.hash(password, 10);
-    db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run(username, hash);
+    db.run('INSERT INTO users (username, password_hash) VALUES (?, ?)', [username, hash]);
+    saveDb();
     res.json({ success: true, message: 'Đăng ký thành công' });
   } catch (err) {
     console.error(err);
@@ -144,12 +168,13 @@ app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Thiếu username/password' });
-    const user = db.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ?').get(username);
+    const stmt = db.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ?');
+    const user = stmt.get([username]);
     if (!user) return res.status(401).json({ error: 'Sai tài khoản hoặc mật khẩu' });
-    const match = await bcrypt.compare(password, user.password_hash);
+    const match = await bcrypt.compare(password, user[2]);
     if (!match) return res.status(401).json({ error: 'Sai tài khoản hoặc mật khẩu' });
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, username: user.username, role: user.role });
+    const token = jwt.sign({ id: user[0], username: user[1], role: user[3] }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, username: user[1], role: user[3] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Lỗi server' });
@@ -168,15 +193,23 @@ app.post('/api/owner/login', (req, res) => {
 app.get('/api/files', authenticateToken, (req, res) => {
   try {
     if (req.user.role === 'owner') {
-      const files = db.prepare(`
+      const results = db.exec(`
         SELECT f.file_id, f.original_name, f.obfuscated_name, f.created_at, u.username 
         FROM files f JOIN users u ON f.user_id = u.id 
         ORDER BY f.created_at DESC
-      `).all();
+      `);
+      const files = results.length > 0 ? results[0].values.map(row => ({
+        file_id: row[0],
+        original_name: row[1],
+        obfuscated_name: row[2],
+        created_at: row[3],
+        username: row[4]
+      })) : [];
       return res.json(files);
     } else {
-      const files = db.prepare('SELECT file_id, original_name, obfuscated_name, created_at FROM files WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id);
-      return res.json(files);
+      const stmt = db.prepare('SELECT file_id, original_name, obfuscated_name, created_at FROM files WHERE user_id = ? ORDER BY created_at DESC');
+      const rows = stmt.getAsObject([req.user.id]);
+      res.json(rows);
     }
   } catch (err) {
     console.error(err);
@@ -186,9 +219,10 @@ app.get('/api/files', authenticateToken, (req, res) => {
 
 app.get('/api/files/:fileId/source', authenticateToken, requireOwner, (req, res) => {
   try {
-    const file = db.prepare('SELECT source_content, original_name FROM files WHERE file_id = ?').get(req.params.fileId);
-    if (!file) return res.status(404).json({ error: 'File không tồn tại' });
-    res.json({ source: file.source_content, original_name: file.original_name });
+    const stmt = db.prepare('SELECT source_content, original_name FROM files WHERE file_id = ?');
+    const row = stmt.get([req.params.fileId]);
+    if (!row) return res.status(404).json({ error: 'File không tồn tại' });
+    res.json({ source: row[0], original_name: row[1] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Lỗi server' });
@@ -204,21 +238,34 @@ app.post('/api/upload', authenticateToken, async (req, res) => {
     const source = file.data.toString('utf-8');
     if (source.trim().length === 0) return res.status(400).json({ error: 'File rỗng' });
 
-    const obfuscated = obfuscateLuaAdvanced(source);
+    let obfuscated;
+    try {
+      obfuscated = obfuscateLuaAdvanced(source);
+    } catch (obfErr) {
+      console.error('Obfuscation error:', obfErr);
+      return res.status(500).json({ error: 'Lỗi trong quá trình obfuscate: ' + obfErr.message });
+    }
+
     const fileId = uuidv4();
     const obfFileName = fileId + '.lua';
     const obfPath = path.join(OBF_DIR, obfFileName);
-    fs.writeFileSync(obfPath, obfuscated, 'utf-8');
+    try {
+      fs.writeFileSync(obfPath, obfuscated, 'utf-8');
+    } catch (writeErr) {
+      console.error('Write file error:', writeErr);
+      return res.status(500).json({ error: 'Không thể ghi file obfuscated' });
+    }
 
-    db.prepare('INSERT INTO files (user_id, file_id, original_name, obfuscated_name, source_content) VALUES (?, ?, ?, ?, ?)').run(
+    db.run('INSERT INTO files (user_id, file_id, original_name, obfuscated_name, source_content) VALUES (?, ?, ?, ?, ?)', [
       req.user.id, fileId, file.name, obfFileName, source
-    );
+    ]);
+    saveDb();
 
     const link = `/f/${obfFileName}`;
     res.json({ success: true, fileId, link, originalName: file.name });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Lỗi server' });
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Lỗi server: ' + err.message });
   }
 });
 
