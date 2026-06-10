@@ -1,61 +1,225 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lua Protect Dashboard</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-body {background:linear-gradient(135deg,#0f172a 0%,#1e1b2e 100%);}
-.card{backdrop-filter:blur(10px);background:rgba(30,41,59,0.7);border:1px solid rgba(255,255,255,0.1);}
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lua Obfuscator Pro</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 20px; background: #f0f2f5; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }
+    input, button { padding: 10px; width: 100%; margin: 5px 0; box-sizing: border-box; }
+    button { background: #007bff; color: white; border: none; cursor: pointer; }
+    button:hover { background: #0056b3; }
+    .hidden { display: none; }
+    .file-list { list-style: none; padding: 0; }
+    .file-list li { background: #e9ecef; margin: 5px 0; padding: 10px; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+    .error { color: red; }
+    .success { color: green; }
+    .role-badge { font-size: 12px; background: #28a745; color: white; padding: 2px 8px; border-radius: 10px; }
+    .owner-panel { border-left: 4px solid #ffc107; }
+  </style>
 </head>
-<body class="text-gray-200 min-h-screen">
-<div class="container mx-auto px-4 py-8 max-w-5xl">
-<h1 class="text-5xl font-bold text-center mb-6 bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 to-purple-500">Lua Protect</h1>
+<body>
+  <h2>Lua Obfuscator Pro - VM Mạnh</h2>
+  <div id="auth-section" class="card">
+    <h3>Đăng nhập / Đăng ký</h3>
+    <input type="text" id="username" placeholder="Username">
+    <input type="password" id="password" placeholder="Password">
+    <button onclick="login()">Đăng nhập</button>
+    <button onclick="register()">Đăng ký</button>
+    <hr>
+    <p>Hoặc đăng nhập với Owner Key</p>
+    <input type="password" id="ownerKeyInput" placeholder="Owner Key">
+    <button onclick="ownerLogin()">Đăng nhập Owner</button>
+    <p id="auth-error" class="error"></p>
+  </div>
 
-<div class="grid md:grid-cols-2 gap-6">
-<div class="card rounded-2xl p-6 shadow-xl">
-<h2 class="text-2xl font-semibold mb-4">📤 Upload Script</h2>
-<form id="uploadForm">
-<textarea id="scriptContent" rows="10" class="w-full p-3 bg-gray-900 rounded-lg border border-gray-700 text-gray-200 font-mono text-sm" placeholder="Paste Lua/Luau code here"></textarea>
-<button type="submit" class="mt-4 w-full bg-green-600 hover:bg-green-700 py-2 rounded-lg font-semibold">🔒 Protect & Get Link</button>
-</form>
-<div id="uploadResult" class="mt-4 text-sm hidden"></div>
-</div>
+  <div id="app-section" class="hidden">
+    <div class="card">
+      <p>Xin chào, <strong id="display-username"></strong> <span id="role-badge" class="role-badge hidden">Owner</span> <button onclick="logout()" style="width:auto">Đăng xuất</button></p>
+      <h3>Upload file .lua</h3>
+      <input type="file" id="fileInput" accept=".lua,.txt">
+      <button onclick="upload()">Upload & Obfuscate</button>
+      <p id="upload-status"></p>
+    </div>
 
-<div class="card rounded-2xl p-6 shadow-xl">
-<h2 class="text-2xl font-semibold mb-4">📜 Scripts</h2>
-<button id="refreshList" class="mb-3 text-sm bg-gray-700 px-3 py-1 rounded hover:bg-gray-600">⟳ Refresh</button>
-<div id="scriptsList" class="max-h-96 overflow-y-auto space-y-2"><p class="text-gray-500 text-center">No scripts yet</p></div>
-</div>
-</div>
-</div>
+    <div id="owner-panel-section" class="card owner-panel hidden">
+      <h3>Quyền Owner - Tất cả file</h3>
+      <button onclick="loadFiles()">Tải lại danh sách</button>
+      <ul class="file-list" id="file-list"></ul>
+    </div>
 
-<script>
-async function uploadScript(){
-const content=document.getElementById('scriptContent').value
-if(!content.trim()) return alert('Enter Lua code!')
-const btn=event.target;btn.disabled=true;btn.innerHTML='⏳ Processing...'
-try{
-const res=await fetch('/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})})
-const data=await res.json()
-const div=document.getElementById('uploadResult')
-if(data.loader){div.innerHTML=`✅ Loader: <code class="bg-gray-800 p-1 rounded break-all">${data.loader}</code>`;div.classList.remove('hidden');refreshScripts();document.getElementById('scriptContent').value=''}else{div.innerHTML='❌ Error';div.classList.remove('hidden')}
-}catch(err){alert('Server error')}finally{btn.disabled=false;btn.innerHTML='🔒 Protect & Get Link'}
-}
+    <div id="user-panel-section" class="card">
+      <h3>File của bạn</h3>
+      <button onclick="loadFiles()">Tải lại danh sách</button>
+      <ul class="file-list" id="file-list-user"></ul>
+    </div>
 
-async function refreshScripts(){
-const listDiv=document.getElementById('scriptsList');listDiv.innerHTML='<p class="text-gray-500">Loading...</p>'
-try{const res=await fetch('/scripts');const data=await res.json()
-if(data.scripts&&data.scripts.length){listDiv.innerHTML=data.scripts.map(s=>`<div class="bg-gray-800/50 p-2 rounded flex justify-between items-center"><span class="truncate font-mono">${s.id}</span><button onclick="copyToClipboard('${s.loadUrl}')" class="bg-blue-600 px-2 py-1 rounded text-xs">📋 Copy</button></div>`).join('')}else{listDiv.innerHTML='<p class="text-gray-500 text-center">No scripts</p>'}}catch(err){listDiv.innerHTML='<p class="text-red-400">Error loading</p>'}
-}
+    <div id="source-modal" style="display:none; position:fixed; top:10%; left:50%; transform:translateX(-50%); background:white; padding:20px; border:1px solid #ccc; max-width:600px; width:100%; max-height:80%; overflow:auto; z-index:1000;">
+      <h4>Source gốc - <span id="source-filename"></span></h4>
+      <pre id="source-content" style="background:#f8f9fa; padding:10px; white-space:pre-wrap;"></pre>
+      <button onclick="closeSource()">Đóng</button>
+    </div>
+  </div>
 
-function copyToClipboard(text){navigator.clipboard.writeText(text);alert('Copied!')}
+  <script>
+    let token = localStorage.getItem('token');
+    let username = localStorage.getItem('username');
+    let role = localStorage.getItem('role');
 
-document.getElementById('uploadForm').addEventListener('submit',e=>{e.preventDefault();uploadScript()})
-document.getElementById('refreshList').addEventListener('click',refreshScripts)
-refreshScripts()
-</script>
+    function checkAuth() {
+      if (token) {
+        document.getElementById('auth-section').classList.add('hidden');
+        document.getElementById('app-section').classList.remove('hidden');
+        document.getElementById('display-username').textContent = username;
+        if (role === 'owner') {
+          document.getElementById('role-badge').classList.remove('hidden');
+          document.getElementById('owner-panel-section').classList.remove('hidden');
+          document.getElementById('user-panel-section').classList.add('hidden');
+        } else {
+          document.getElementById('role-badge').classList.add('hidden');
+          document.getElementById('owner-panel-section').classList.add('hidden');
+          document.getElementById('user-panel-section').classList.remove('hidden');
+        }
+        loadFiles();
+      } else {
+        document.getElementById('auth-section').classList.remove('hidden');
+        document.getElementById('app-section').classList.add('hidden');
+      }
+    }
+    checkAuth();
+
+    async function register() {
+      const user = document.getElementById('username').value;
+      const pass = document.getElementById('password').value;
+      const res = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: user, password: pass })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById('auth-error').textContent = '';
+        alert('Đăng ký thành công, mời đăng nhập');
+      } else {
+        document.getElementById('auth-error').textContent = data.error;
+      }
+    }
+
+    async function login() {
+      const user = document.getElementById('username').value;
+      const pass = document.getElementById('password').value;
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: user, password: pass })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        token = data.token;
+        username = data.username;
+        role = data.role;
+        localStorage.setItem('token', token);
+        localStorage.setItem('username', username);
+        localStorage.setItem('role', role);
+        checkAuth();
+      } else {
+        document.getElementById('auth-error').textContent = data.error;
+      }
+    }
+
+    async function ownerLogin() {
+      const key = document.getElementById('ownerKeyInput').value;
+      const res = await fetch('/api/owner/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerKey: key })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        token = data.token;
+        username = data.username;
+        role = data.role;
+        localStorage.setItem('token', token);
+        localStorage.setItem('username', username);
+        localStorage.setItem('role', role);
+        checkAuth();
+      } else {
+        document.getElementById('auth-error').textContent = data.error;
+      }
+    }
+
+    function logout() {
+      token = null; username = null; role = null;
+      localStorage.removeItem('token'); localStorage.removeItem('username'); localStorage.removeItem('role');
+      checkAuth();
+    }
+
+    async function upload() {
+      const file = document.getElementById('fileInput').files[0];
+      if (!file) return alert('Chọn file');
+      const formData = new FormData();
+      formData.append('luafile', file);
+      document.getElementById('upload-status').textContent = 'Đang tải lên...';
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token },
+        body: formData
+      });
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById('upload-status').innerHTML = `✅ Thành công! <a href="${data.link}" target="_blank">${data.link}</a>`;
+        loadFiles();
+      } else {
+        document.getElementById('upload-status').textContent = '❌ ' + data.error;
+      }
+    }
+
+    async function loadFiles() {
+      const res = await fetch('/api/files', {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      const files = await res.json();
+      const listContainer = role === 'owner' ? document.getElementById('file-list') : document.getElementById('file-list-user');
+      if (!files.length) {
+        listContainer.innerHTML = '<li>Chưa có file nào</li>';
+        return;
+      }
+      listContainer.innerHTML = files.map(f => {
+        let extra = '';
+        if (role === 'owner') {
+          extra = `<button onclick="viewSource('${f.file_id}','${f.original_name}')">Xem source gốc</button>`;
+        }
+        return `
+          <li>
+            <span>${f.original_name} ${role === 'owner' ? '(user: '+f.username+')' : ''}</span>
+            <span>
+              <a href="/f/${f.obfuscated_name}" target="_blank">Link obf</a>
+              ${extra}
+            </span>
+            <span style="font-size:small">${f.created_at}</span>
+          </li>
+        `;
+      }).join('');
+    }
+
+    async function viewSource(fileId, fileName) {
+      const res = await fetch(`/api/files/${fileId}/source`, {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById('source-filename').textContent = fileName;
+        document.getElementById('source-content').textContent = data.source;
+        document.getElementById('source-modal').style.display = 'block';
+      } else {
+        alert(data.error);
+      }
+    }
+
+    function closeSource() {
+      document.getElementById('source-modal').style.display = 'none';
+    }
+  </script>
 </body>
 </html>
