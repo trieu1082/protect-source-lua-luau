@@ -84,40 +84,40 @@ function validateLua(source) {
 }
 
 function obfuscateLuaAdvanced(source) {
-  const mainKey = Array.from({ length: 48 }, () => Math.floor(Math.random() * 256));
-  const junkFunctions = [
-    `local function __junk1() local x=0 for i=1,10 do x=x+i end return x end`,
-    `local function __junk2() local t={} for i=1,5 do t[i]=i*i end return t end`,
-    `local function __junk3() local s=""; for i=1,4 do s=s..i end return s end`,
-    `local function __junk4() return math.random() end`,
-    `local function __junk5() local a=1; local b=2; return a+b end`
+  const key = Array.from({ length: 64 }, () => Math.floor(Math.random() * 256));
+  const shiftKey = Array.from({ length: 16 }, () => Math.floor(Math.random() * 256));
+  const garbagePool = [
+    `local function _G1() local _=0 for _=1,8 do _=_+_ end return _ end`,
+    `local function _G2() local _=table.pack or function(...) return {...} end return _(1,2,3) end`,
+    `local function _G3() local _=math.random(1,100) return _ end`,
+    `local function _G4() local _="abcdef" return #_ end`,
+    `local function _G5() local _=os.clock and os.clock() or 0 return _ end`
   ];
-  const selectedJunk = [];
-  for (let i = 0; i < 2 + Math.floor(Math.random() * 3); i++) {
-    selectedJunk.push(junkFunctions[Math.floor(Math.random() * junkFunctions.length)]);
+  const junkFuncs = [];
+  for (let i = 0; i < 3 + Math.floor(Math.random() * 4); i++) {
+    junkFuncs.push(garbagePool[Math.floor(Math.random() * garbagePool.length)]);
   }
 
-  const sourceBytes = Array.from(Buffer.from(source, 'utf-8'));
-  const encStage1 = sourceBytes.map((byte, i) => (byte ^ mainKey[i % mainKey.length]) & 0xFF);
-  const chunkSize = 23 + Math.floor(Math.random() * 30);
+  const bytes = Array.from(Buffer.from(source, 'utf-8'));
+  const layer1 = bytes.map((b, i) => (b + key[i % key.length] + i * 3) % 256);
   const chunks = [];
-  for (let i = 0; i < encStage1.length; i += chunkSize) {
-    chunks.push(encStage1.slice(i, i + chunkSize));
+  const chunkSize = 17 + Math.floor(Math.random() * 31);
+  for (let i = 0; i < layer1.length; i += chunkSize) {
+    chunks.push(layer1.slice(i, i + chunkSize));
   }
 
   const subKeys = chunks.map((_, idx) => {
-    const base = idx * 13;
-    return Array.from({ length: 8 }, (_, j) => (mainKey[(base + j) % mainKey.length] + idx + j) & 0xFF);
+    const off = idx * 11;
+    return Array.from({ length: 12 }, (_, j) => (key[(off + j) % key.length] + idx * 7 + j * 13) % 256);
   });
 
   const encryptedChunks = chunks.map((chunk, idx) => {
     return chunk.map((byte, i) => {
-      return ((byte + subKeys[idx][i % 8]) + idx * 3) & 0xFF;
+      return (byte ^ subKeys[idx][i % 12] ^ shiftKey[i % shiftKey.length]) % 256;
     });
   });
 
   const constTable = encryptedChunks.map(arr => arr.join(','));
-
   const bytecode = [];
   for (let i = 0; i < encryptedChunks.length; i++) {
     bytecode.push(1, i);
@@ -127,22 +127,23 @@ function obfuscateLuaAdvanced(source) {
   }
   bytecode.push(3);
 
-  const garbageOpcodes = [10, 11, 12, 13, 14];
+  const fakeOps = [20, 21, 22, 23, 24];
   const finalBytecode = [];
-  for (let i = 0; i < bytecode.length; i++) {
-    finalBytecode.push(bytecode[i]);
-    if (Math.random() < 0.3) {
-      finalBytecode.push(garbageOpcodes[Math.floor(Math.random() * garbageOpcodes.length)]);
+  for (const b of bytecode) {
+    finalBytecode.push(b);
+    if (Math.random() < 0.4) {
+      finalBytecode.push(fakeOps[Math.floor(Math.random() * fakeOps.length)]);
     }
   }
 
-  const keyStr = mainKey.join(',');
+  const keyStr = key.join(',');
+  const shiftStr = shiftKey.join(',');
   const constTableStr = '{' + constTable.map(c => `{${c}}`).join(',') + '}';
   const bytecodeStr = '{' + finalBytecode.join(',') + '}';
   const subKeysStr = '{' + subKeys.map(k => `{${k.join(',')}}`).join(',') + '}';
-  const junkStr = selectedJunk.join(';');
+  const junkStr = junkFuncs.join(';');
 
-  const vmLoader = `local function _INIT() ${junkStr} local key={${keyStr}} local sub_keys=${subKeysStr} local const_tbl=${constTableStr} local bytecode=${bytecodeStr} local stack={} local ip=1 while ip<=#bytecode do local op=bytecode[ip] if op==1 then local idx=bytecode[ip+1] local enc=const_tbl[idx+1] local sk=sub_keys[idx+1] local chars={} for i=1,#enc do local raw=(enc[i]-idx*3)&0xFF raw=(raw-sk[(i-1)%8])&0xFF chars[i]=string.char(raw~key[(i-1)%48+1]) end stack[#stack+1]=table.concat(chars) ip=ip+2 elseif op==2 then local b=stack[#stack] stack[#stack]=nil local a=stack[#stack] stack[#stack]=nil stack[#stack+1]=a..b ip=ip+1 elseif op==3 then local code=stack[#stack] local fn,err=loadstring(code) if fn then fn() end return else ip=ip+1 end end end _INIT()`;
+  const vmLoader = `local _loadstring=loadstring or load local _INIT=function() ${junkStr} local key={${keyStr}} local shift={${shiftStr}} local sub_keys=${subKeysStr} local const_tbl=${constTableStr} local bytecode=${bytecodeStr} local stack={} local ip=1 while ip<=#bytecode do local op=bytecode[ip] if op==1 then local idx=bytecode[ip+1] local enc=const_tbl[idx+1] local sk=sub_keys[idx+1] local chars={} for i=1,#enc do local v=(enc[i]~shift[(i-1)%16+1])%256 v=(v~sk[(i-1)%12+1])%256 v=(v-idx*3)%256 v=(v-key[(i-1)%64+1])%256 chars[i]=string.char(v) end stack[#stack+1]=table.concat(chars) ip=ip+2 elseif op==2 then local b=stack[#stack] stack[#stack]=nil local a=stack[#stack] stack[#stack]=nil stack[#stack+1]=a..b ip=ip+1 elseif op==3 then local code=stack[#stack] local fn,err=_loadstring(code) if fn then fn() end return else ip=ip+1 end end end _INIT()`;
   return vmLoader;
 }
 
