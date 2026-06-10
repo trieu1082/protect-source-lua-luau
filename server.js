@@ -14,6 +14,7 @@ const OWNER_KEY = process.env.OWNER_KEY || 'owner_secret_key_123';
 const DB_PATH = './database.sqlite';
 
 let db;
+
 async function initDb() {
   const SQL = await initSqlJs();
   if (fs.existsSync(DB_PATH)) {
@@ -43,16 +44,13 @@ async function initDb() {
       FOREIGN KEY (user_id) REFERENCES users(id)
     )
   `);
-  try {
-    db.run('ALTER TABLE files ADD COLUMN obfuscated_content TEXT');
-  } catch (e) {}
+  try { db.run('ALTER TABLE files ADD COLUMN obfuscated_content TEXT'); } catch (e) {}
   saveDb();
 }
 
 function saveDb() {
   const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(DB_PATH, buffer);
+  fs.writeFileSync(DB_PATH, Buffer.from(data));
 }
 
 initDb().catch(err => {
@@ -64,9 +62,11 @@ app.use(express.json());
 app.use(fileUpload({ limits: { fileSize: 5 * 1024 * 1024 } }));
 app.use(express.static('public'));
 
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
 function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const auth = req.headers['authorization'];
+  const token = auth && auth.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Thiếu token' });
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Token không hợp lệ' });
@@ -80,80 +80,112 @@ function requireOwner(req, res, next) {
   next();
 }
 
+// ─── Obfuscator ───────────────────────────────────────────────────────────────
+
 function obfuscateLuaAdvanced(source) {
+  // Tạo key ngẫu nhiên
   const key = Array.from({ length: 64 }, () => Math.floor(Math.random() * 256));
   const shiftKey = Array.from({ length: 16 }, () => Math.floor(Math.random() * 256));
-  const garbagePool = [
-    `local function _G1() local _=0 for _=1,8 do _=_+_ end return _ end`,
-    `local function _G2() local _=table.pack or function(...) return {...} end return _(1,2,3) end`,
-    `local function _G3() local _=math.random(1,100) return _ end`,
-    `local function _G4() local _="abcdef" return #_ end`,
-    `local function _G5() local _=os.clock and os.clock() or 0 return _ end`
-  ];
-  const junkFuncs = [];
-  for (let i = 0; i < 3 + Math.floor(Math.random() * 4); i++) {
-    junkFuncs.push(garbagePool[Math.floor(Math.random() * garbagePool.length)]);
-  }
 
+  // Chunksize cố định (không random) để Lua VM biết chính xác globalIndex
+  const chunkSize = 32;
+
+  // Bước 1: encode bytes gốc, dùng globalIndex đúng
   const bytes = Array.from(Buffer.from(source, 'utf-8'));
-  const layer1 = bytes.map((b, i) => (b + key[i % key.length] + i * 3) % 256);
+  const layer1 = bytes.map((b, gi) => (b + key[gi % 64] + gi * 3) % 256);
+
+  // Bước 2: chia chunk
   const chunks = [];
-  const chunkSize = 17 + Math.floor(Math.random() * 31);
   for (let i = 0; i < layer1.length; i += chunkSize) {
     chunks.push(layer1.slice(i, i + chunkSize));
   }
 
+  // Bước 3: subkey per chunk
   const subKeys = chunks.map((_, idx) => {
     const off = idx * 11;
-    return Array.from({ length: 12 }, (_, j) => (key[(off + j) % key.length] + idx * 7 + j * 13) % 256);
+    return Array.from({ length: 12 }, (_, j) => (key[(off + j) % 64] + idx * 7 + j * 13) % 256);
   });
 
-  const encryptedChunks = chunks.map((chunk, idx) => {
-    return chunk.map((byte, i) => {
-      return (byte ^ subKeys[idx][i % 12] ^ shiftKey[i % shiftKey.length]) % 256;
-    });
-  });
+  // Bước 4: XOR encrypt từng byte trong chunk
+  const encryptedChunks = chunks.map((chunk, idx) =>
+    chunk.map((byte, i) =>
+      (byte ^ subKeys[idx][i % 12] ^ shiftKey[i % 16]) % 256
+    )
+  );
 
-  const constTable = encryptedChunks.map(arr => arr.join(','));
-  const bytecode = [];
-  for (let i = 0; i < encryptedChunks.length; i++) {
-    bytecode.push(1, i);
-  }
-  for (let i = 0; i < encryptedChunks.length - 1; i++) {
-    bytecode.push(2);
-  }
-  bytecode.push(3);
+  // Build Lua data strings
+  const keyStr       = key.join(',');
+  const shiftStr     = shiftKey.join(',');
+  const constTblStr  = '{' + encryptedChunks.map(arr => '{' + arr.join(',') + '}').join(',') + '}';
+  const subKeysStr   = '{' + subKeys.map(sk => '{' + sk.join(',') + '}').join(',') + '}';
+  const nChunks      = encryptedChunks.length;
 
-  const fakeOps = [20, 21, 22, 23, 24];
-  const finalBytecode = [];
-  for (const b of bytecode) {
-    finalBytecode.push(b);
-    if (Math.random() < 0.4) {
-      finalBytecode.push(fakeOps[Math.floor(Math.random() * fakeOps.length)]);
-    }
-  }
+  // Junk functions (không ảnh hưởng runtime)
+  const junkPool = [
+    `local function _J1() local x=0 for i=1,8 do x=x+i end return x end`,
+    `local function _J2() return math.max(1,2) end`,
+    `local function _J3() local t={} for i=1,4 do t[i]=i*2 end return #t end`,
+    `local function _J4() return type("lua") end`,
+    `local function _J5() return string.len("obf") end`,
+  ];
+  const junkCount = 2 + Math.floor(Math.random() * 3);
+  const junk = Array.from({ length: junkCount }, () =>
+    junkPool[Math.floor(Math.random() * junkPool.length)]
+  ).join(' ');
 
-  const keyStr = key.join(',');
-  const shiftStr = shiftKey.join(',');
-  const constTableStr = '{' + constTable.map(c => `{${c}}`).join(',') + '}';
-  const bytecodeStr = '{' + finalBytecode.join(',') + '}';
-  const subKeysStr = '{' + subKeys.map(k => `{${k.join(',')}}`).join(',') + '}';
-  const junkStr = junkFuncs.join(';');
+  // VM Lua: decode đúng thứ tự ngược lại với encode
+  // Encode:  layer1[gi] = (b + key[gi%64] + gi*3) % 256
+  //          enc[i]     = layer1 ^ subKey[i%12] ^ shift[i%16]
+  // Decode:  layer1     = enc ^ shift ^ subKey   (XOR tự nghịch)
+  //          b          = (layer1 - key[gi%64] - gi*3) % 256  (mod 256, Lua % luôn >= 0)
+  //
+  // gi = idx * chunkSize + (i-1)   (i là 1-based trong Lua)
 
-  const vmLoader = `local _loadstring=loadstring or load local _INIT=function() ${junkStr} local key={${keyStr}} local shift={${shiftStr}} local sub_keys=${subKeysStr} local const_tbl=${constTableStr} local bytecode=${bytecodeStr} local stack={} local ip=1 while ip<=#bytecode do local op=bytecode[ip] if op==1 then local idx=bytecode[ip+1] local enc=const_tbl[idx+1] local sk=sub_keys[idx+1] local chars={} for i=1,#enc do local v=(enc[i]~shift[(i-1)%16+1])%256 v=(v~sk[(i-1)%12+1])%256 v=(v-idx*3)%256 v=(v-key[(i-1)%64+1])%256 chars[i]=string.char(v) end stack[#stack+1]=table.concat(chars) ip=ip+2 elseif op==2 then local b=stack[#stack] stack[#stack]=nil local a=stack[#stack] stack[#stack]=nil stack[#stack+1]=a..b ip=ip+1 elseif op==3 then local code=stack[#stack] local fn,err=_loadstring(code) if fn then fn() end return else ip=ip+1 end end end _INIT()`;
+  const vmLoader =
+`local _ls=loadstring or load
+local function _INIT()
+  ${junk}
+  local key={${keyStr}}
+  local shift={${shiftStr}}
+  local sub_keys=${subKeysStr}
+  local const_tbl=${constTblStr}
+  local CS=${chunkSize}
+  local parts={}
+  for idx=0,${nChunks - 1} do
+    local enc=const_tbl[idx+1]
+    local sk=sub_keys[idx+1]
+    local chars={}
+    for i=1,#enc do
+      local gi=idx*CS+(i-1)
+      local v=enc[i]
+      v=(v~shift[i%16+1])%256
+      v=(v~sk[i%12+1])%256
+      v=(v-key[gi%64+1]-gi*3)%256
+      chars[i]=string.char(v)
+    end
+    parts[idx+1]=table.concat(chars)
+  end
+  local code=table.concat(parts)
+  local fn,err=_ls(code)
+  if fn then fn() else error("obf err: "..(err or "?")) end
+end
+_INIT()`;
+
   return vmLoader;
 }
+
+// ─── Auth Routes ──────────────────────────────────────────────────────────────
 
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Thiếu username/password' });
-    if (username.length < 3 || password.length < 4) return res.status(400).json({ error: 'Username >=3, password >=4' });
-    const stmt = db.prepare('SELECT id FROM users WHERE username = ?');
-    const existing = stmt.get([username]);
+    if (username.length < 3 || password.length < 4)
+      return res.status(400).json({ error: 'Username >=3 ký tự, password >=4 ký tự' });
+    const existing = db.prepare('SELECT id FROM users WHERE username=?').get([username]);
     if (existing) return res.status(409).json({ error: 'Username đã tồn tại' });
     const hash = await bcrypt.hash(password, 10);
-    db.run('INSERT INTO users (username, password_hash) VALUES (?, ?)', [username, hash]);
+    db.run('INSERT INTO users (username, password_hash) VALUES (?,?)', [username, hash]);
     saveDb();
     res.json({ success: true, message: 'Đăng ký thành công' });
   } catch (err) {
@@ -166,8 +198,7 @@ app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Thiếu username/password' });
-    const stmt = db.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ?');
-    const user = stmt.get([username]);
+    const user = db.prepare('SELECT id, username, password_hash, role FROM users WHERE username=?').get([username]);
     if (!user) return res.status(401).json({ error: 'Sai tài khoản hoặc mật khẩu' });
     const match = await bcrypt.compare(password, user[2]);
     if (!match) return res.status(401).json({ error: 'Sai tài khoản hoặc mật khẩu' });
@@ -181,34 +212,41 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/owner/login', (req, res) => {
   const { ownerKey } = req.body;
-  if (!ownerKey || ownerKey !== OWNER_KEY) {
+  if (!ownerKey || ownerKey !== OWNER_KEY)
     return res.status(401).json({ error: 'Owner key không hợp lệ' });
-  }
   const token = jwt.sign({ id: 0, username: 'owner', role: 'owner' }, JWT_SECRET, { expiresIn: '24h' });
   res.json({ token, username: 'owner', role: 'owner' });
 });
+
+// ─── File Routes ──────────────────────────────────────────────────────────────
 
 app.get('/api/files', authenticateToken, (req, res) => {
   try {
     if (req.user.role === 'owner') {
       const results = db.exec(`
-        SELECT f.file_id, f.original_name, f.obfuscated_name, f.created_at, u.username 
-        FROM files f JOIN users u ON f.user_id = u.id 
+        SELECT f.file_id, f.original_name, f.obfuscated_name, f.created_at, u.username
+        FROM files f JOIN users u ON f.user_id=u.id
         ORDER BY f.created_at DESC
       `);
-      const files = results.length > 0 ? results[0].values.map(row => ({
-        file_id: row[0],
-        original_name: row[1],
-        obfuscated_name: row[2],
-        created_at: row[3],
-        username: row[4]
-      })) : [];
+      const files = results.length > 0
+        ? results[0].values.map(r => ({
+            file_id: r[0], original_name: r[1],
+            obfuscated_name: r[2], created_at: r[3], username: r[4]
+          }))
+        : [];
       return res.json(files);
-    } else {
-      const stmt = db.prepare('SELECT file_id, original_name, obfuscated_name, created_at FROM files WHERE user_id = ? ORDER BY created_at DESC');
-      const rows = stmt.getAsObject([req.user.id]);
-      res.json(rows);
     }
+    // user thường: dùng exec để lấy nhiều rows
+    const results = db.exec(
+      `SELECT file_id, original_name, obfuscated_name, created_at FROM files WHERE user_id=${req.user.id} ORDER BY created_at DESC`
+    );
+    const files = results.length > 0
+      ? results[0].values.map(r => ({
+          file_id: r[0], original_name: r[1],
+          obfuscated_name: r[2], created_at: r[3]
+        }))
+      : [];
+    res.json(files);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Lỗi server' });
@@ -217,8 +255,7 @@ app.get('/api/files', authenticateToken, (req, res) => {
 
 app.get('/api/files/:fileId/source', authenticateToken, requireOwner, (req, res) => {
   try {
-    const stmt = db.prepare('SELECT source_content, original_name FROM files WHERE file_id = ?');
-    const row = stmt.get([req.params.fileId]);
+    const row = db.prepare('SELECT source_content, original_name FROM files WHERE file_id=?').get([req.params.fileId]);
     if (!row) return res.status(404).json({ error: 'File không tồn tại' });
     res.json({ source: row[0], original_name: row[1] });
   } catch (err) {
@@ -227,12 +264,12 @@ app.get('/api/files/:fileId/source', authenticateToken, requireOwner, (req, res)
   }
 });
 
+// Public endpoint: trả về file obfuscated
 app.get('/f/:fileId', (req, res) => {
   try {
     let fileId = req.params.fileId;
     if (fileId.endsWith('.lua')) fileId = fileId.slice(0, -4);
-    const stmt = db.prepare('SELECT obfuscated_content FROM files WHERE file_id = ?');
-    const row = stmt.get([fileId]);
+    const row = db.prepare('SELECT obfuscated_content FROM files WHERE file_id=?').get([fileId]);
     if (!row || !row[0]) return res.status(404).send('File không tồn tại hoặc đã bị xóa');
     res.type('text/plain').send(row[0]);
   } catch (err) {
@@ -243,12 +280,15 @@ app.get('/f/:fileId', (req, res) => {
 
 app.post('/api/upload', authenticateToken, async (req, res) => {
   try {
-    if (!req.files || !req.files.luafile) return res.status(400).json({ error: 'Chưa chọn file' });
+    if (!req.files || !req.files.luafile)
+      return res.status(400).json({ error: 'Chưa chọn file' });
     const file = req.files.luafile;
     const ext = path.extname(file.name).toLowerCase();
-    if (ext !== '.lua' && ext !== '.txt') return res.status(400).json({ error: 'Chỉ chấp nhận file .lua hoặc .txt' });
+    if (ext !== '.lua' && ext !== '.txt')
+      return res.status(400).json({ error: 'Chỉ chấp nhận file .lua hoặc .txt' });
     const source = file.data.toString('utf-8');
-    if (source.trim().length === 0) return res.status(400).json({ error: 'File rỗng' });
+    if (source.trim().length === 0)
+      return res.status(400).json({ error: 'File rỗng' });
 
     let obfuscated;
     try {
@@ -259,20 +299,20 @@ app.post('/api/upload', authenticateToken, async (req, res) => {
     }
 
     const fileId = uuidv4();
-    const obfFileName = fileId + '.lua';
-
-    db.run('INSERT INTO files (user_id, file_id, original_name, obfuscated_name, source_content, obfuscated_content) VALUES (?, ?, ?, ?, ?, ?)', [
-      req.user.id, fileId, file.name, obfFileName, source, obfuscated
-    ]);
+    db.run(
+      'INSERT INTO files (user_id, file_id, original_name, obfuscated_name, source_content, obfuscated_content) VALUES (?,?,?,?,?,?)',
+      [req.user.id, fileId, file.name, fileId + '.lua', source, obfuscated]
+    );
     saveDb();
 
-    const link = `/f/${fileId}.lua`;
-    res.json({ success: true, fileId, link, originalName: file.name });
+    res.json({ success: true, fileId, link: `/f/${fileId}.lua`, originalName: file.name });
   } catch (err) {
     console.error('Upload error:', err);
     res.status(500).json({ error: 'Lỗi server: ' + err.message });
   }
 });
+
+// ─── Start ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`Server chạy tại http://localhost:${PORT}`);
