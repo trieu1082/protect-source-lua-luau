@@ -12,11 +12,6 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_key_change_me';
 const OWNER_KEY = process.env.OWNER_KEY || 'owner_secret_key_123';
 const DB_PATH = './database.sqlite';
-const OBF_DIR = path.join(__dirname, 'obfuscated');
-
-if (!fs.existsSync(OBF_DIR)) {
-  fs.mkdirSync(OBF_DIR, { recursive: true });
-}
 
 let db;
 async function initDb() {
@@ -43,10 +38,14 @@ async function initDb() {
       original_name TEXT,
       obfuscated_name TEXT,
       source_content TEXT,
+      obfuscated_content TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id)
     )
   `);
+  try {
+    db.run('ALTER TABLE files ADD COLUMN obfuscated_content TEXT');
+  } catch (e) { }
   saveDb();
 }
 
@@ -64,7 +63,6 @@ initDb().catch(err => {
 app.use(express.json());
 app.use(fileUpload({ limits: { fileSize: 5 * 1024 * 1024 } }));
 app.use(express.static('public'));
-app.use('/f', express.static(OBF_DIR));
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -229,6 +227,20 @@ app.get('/api/files/:fileId/source', authenticateToken, requireOwner, (req, res)
   }
 });
 
+app.get('/f/:fileId', (req, res) => {
+  try {
+    let fileId = req.params.fileId;
+    if (fileId.endsWith('.lua')) fileId = fileId.slice(0, -4);
+    const stmt = db.prepare('SELECT obfuscated_content FROM files WHERE file_id = ?');
+    const row = stmt.get([fileId]);
+    if (!row) return res.status(404).send('File không tồn tại hoặc đã bị xóa');
+    res.type('text/plain').send(row[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Lỗi server');
+  }
+});
+
 app.post('/api/upload', authenticateToken, async (req, res) => {
   try {
     if (!req.files || !req.files.luafile) return res.status(400).json({ error: 'Chưa chọn file' });
@@ -243,25 +255,18 @@ app.post('/api/upload', authenticateToken, async (req, res) => {
       obfuscated = obfuscateLuaAdvanced(source);
     } catch (obfErr) {
       console.error('Obfuscation error:', obfErr);
-      return res.status(500).json({ error: 'Lỗi trong quá trình obfuscate: ' + obfErr.message });
+      return res.status(500).json({ error: 'Lỗi obfuscate: ' + obfErr.message });
     }
 
     const fileId = uuidv4();
     const obfFileName = fileId + '.lua';
-    const obfPath = path.join(OBF_DIR, obfFileName);
-    try {
-      fs.writeFileSync(obfPath, obfuscated, 'utf-8');
-    } catch (writeErr) {
-      console.error('Write file error:', writeErr);
-      return res.status(500).json({ error: 'Không thể ghi file obfuscated' });
-    }
 
-    db.run('INSERT INTO files (user_id, file_id, original_name, obfuscated_name, source_content) VALUES (?, ?, ?, ?, ?)', [
-      req.user.id, fileId, file.name, obfFileName, source
+    db.run('INSERT INTO files (user_id, file_id, original_name, obfuscated_name, source_content, obfuscated_content) VALUES (?, ?, ?, ?, ?, ?)', [
+      req.user.id, fileId, file.name, obfFileName, source, obfuscated
     ]);
     saveDb();
 
-    const link = `/f/${obfFileName}`;
+    const link = `/f/${fileId}.lua`;
     res.json({ success: true, fileId, link, originalName: file.name });
   } catch (err) {
     console.error('Upload error:', err);
