@@ -45,7 +45,7 @@ async function initDb() {
   `);
   try {
     db.run('ALTER TABLE files ADD COLUMN obfuscated_content TEXT');
-  } catch (e) { }
+  } catch (e) {}
   saveDb();
 }
 
@@ -233,7 +233,7 @@ app.get('/f/:fileId', (req, res) => {
     if (fileId.endsWith('.lua')) fileId = fileId.slice(0, -4);
     const stmt = db.prepare('SELECT obfuscated_content FROM files WHERE file_id = ?');
     const row = stmt.get([fileId]);
-    if (!row) return res.status(404).send('File không tồn tại hoặc đã bị xóa');
+    if (!row || !row[0]) return res.status(404).send('File không tồn tại hoặc đã bị xóa');
     res.type('text/plain').send(row[0]);
   } catch (err) {
     console.error(err);
