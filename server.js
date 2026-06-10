@@ -6,7 +6,6 @@ const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-const luaparse = require('luaparse');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -59,28 +58,6 @@ function authenticateToken(req, res, next) {
 function requireOwner(req, res, next) {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Yêu cầu quyền owner' });
   next();
-}
-
-function validateLua(source) {
-  try {
-    luaparse.parse(source, {
-      locations: true,
-      scope: true,
-      comments: false,
-      luaVersion: '5.1'
-    });
-    return { valid: true };
-  } catch (e) {
-    if (e instanceof luaparse.SyntaxError) {
-      return {
-        valid: false,
-        error: e.message,
-        line: e.line,
-        column: e.column
-      };
-    }
-    return { valid: false, error: e.message };
-  }
 }
 
 function obfuscateLuaAdvanced(source) {
@@ -226,13 +203,6 @@ app.post('/api/upload', authenticateToken, async (req, res) => {
     if (ext !== '.lua' && ext !== '.txt') return res.status(400).json({ error: 'Chỉ chấp nhận file .lua hoặc .txt' });
     const source = file.data.toString('utf-8');
     if (source.trim().length === 0) return res.status(400).json({ error: 'File rỗng' });
-
-    const validation = validateLua(source);
-    if (!validation.valid) {
-      return res.status(400).json({
-        error: `Lỗi cú pháp Lua: ${validation.error}${validation.line ? ` tại dòng ${validation.line}` : ''}`
-      });
-    }
 
     const obfuscated = obfuscateLuaAdvanced(source);
     const fileId = uuidv4();
